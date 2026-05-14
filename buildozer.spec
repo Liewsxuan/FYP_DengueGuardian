@@ -37,7 +37,7 @@ version = 1.0
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy==2.3.0,kivymd==1.1.1,requests,urllib3,certifi,charset_normalizer,idna,plyer,pillow,kivy_garden.mapview
+requirements = python3,kivy==2.2.1,kivymd==1.1.1,requests,urllib3,certifi,charset_normalizer,idna,plyer,pillow,kivy_garden.mapview
 
 # (str) Custom source folders for requirements
 # Sets custom source for any requirements with recipes
@@ -196,7 +196,7 @@ android.accept_sdk_license = True
 # android.add_resources = my_icons/all-inclusive.png:drawable/all_inclusive.png
 # 2) A directory, here  'legal_icons' must contain resources of one kind
 # android.add_resources = legal_icons:drawable
-# 3) A directory, here 'legal_resources' must contain one or more directories, 
+# 3) A directory, here  'legal_resources' must contain one or more directories, 
 # each of a resource kind:  drawable, xml, etc...
 # android.add_resources = legal_resources
 #android.add_resources =
