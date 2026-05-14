@@ -1,79 +1,75 @@
 name: Build APK
 
 on:
-push:
-branches:
-- main
+  push:
+    branches:
+      - main
 
 jobs:
-build:
+  build:
+    runs-on: ubuntu-latest
 
-```
-runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
 
-steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-- name: Checkout Source
-  uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: |
+          sudo apt update
 
-- name: Set up Python
-  uses: actions/setup-python@v5
-  with:
-    python-version: '3.11'
+          sudo apt install -y \
+            zip unzip openjdk-17-jdk \
+            python3-pip \
+            build-essential \
+            git \
+            autoconf \
+            libtool \
+            pkg-config \
+            zlib1g-dev \
+            libncurses5-dev \
+            libncursesw5-dev \
+            libtinfo5 \
+            cmake \
+            libffi-dev \
+            libssl-dev \
+            libsqlite3-dev \
+            sqlite3 \
+            bzip2 \
+            libbz2-dev \
+            libreadline-dev \
+            libgdbm-dev \
+            liblzma-dev \
+            tk-dev \
+            ffmpeg \
+            libsdl2-dev \
+            libsdl2-image-dev \
+            libsdl2-mixer-dev \
+            libsdl2-ttf-dev \
+            libportmidi-dev \
+            libswscale-dev \
+            libavformat-dev \
+            libavcodec-dev \
+            libgstreamer1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good
 
-- name: Install Dependencies
-  run: |
-    sudo apt update
+      - name: Install Python Packages
+        run: |
+          pip install --upgrade pip
+          pip install Cython==0.29.33
+          pip install buildozer==1.5.0
 
-    sudo apt install -y \
-      zip unzip openjdk-17-jdk \
-      python3-pip \
-      build-essential \
-      git \
-      autoconf \
-      libtool \
-      pkg-config \
-      zlib1g-dev \
-      libncurses5-dev \
-      libncursesw5-dev \
-      libtinfo5 \
-      cmake \
-      libffi-dev \
-      libssl-dev \
-      libsqlite3-dev \
-      sqlite3 \
-      bzip2 \
-      libbz2-dev \
-      libreadline-dev \
-      libgdbm-dev \
-      liblzma-dev \
-      tk-dev \
-      ffmpeg \
-      libsdl2-dev \
-      libsdl2-image-dev \
-      libsdl2-mixer-dev \
-      libsdl2-ttf-dev \
-      libportmidi-dev \
-      libswscale-dev \
-      libavformat-dev \
-      libavcodec-dev \
-      libgstreamer1.0-dev \
-      gstreamer1.0-plugins-base \
-      gstreamer1.0-plugins-good
+      - name: Build APK
+        run: |
+          buildozer android debug
 
-- name: Install Python Packages
-  run: |
-    pip install --upgrade pip
-    pip install Cython==0.29.33
-    pip install buildozer==1.5.0
-
-- name: Build APK
-  run: |
-    buildozer android debug
-
-- name: Upload APK
-  uses: actions/upload-artifact@v4
-  with:
-    name: apk
-    path: bin/*.apk
-```
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: bin/*.apk
