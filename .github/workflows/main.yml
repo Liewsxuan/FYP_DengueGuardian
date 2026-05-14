@@ -44,7 +44,6 @@ jobs:
             libgdbm-dev \
             liblzma-dev \
             tk-dev \
-            ffmpeg \
             libsdl2-dev \
             libsdl2-image-dev \
             libsdl2-mixer-dev \
@@ -53,9 +52,6 @@ jobs:
             libswscale-dev \
             libavformat-dev \
             libavcodec-dev \
-            libgstreamer1.0-dev \
-            gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good
 
       - name: Install Python Packages
         run: |
