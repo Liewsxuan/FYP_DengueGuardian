@@ -63,100 +63,117 @@ jobs:
           echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
           echo "/usr/lib/ccache" >> $GITHUB_PATH
 
-      # ----------------------------------------------------------------
-      # ROOT CAUSE (confirmed from traceback):
-      #
-      #   /tmp/build-env-5pg87swv/lib/python3.14/site-packages/Cython/...
-      #
-      # p4a calls `pip install` inside a throw-away venv at /tmp/build-env-*/
-      # That venv is created using the system `venv` module which belongs
-      # to Python 3.14 on this runner image (ImageVersion 20260513).
-      # pip then installs the LATEST Cython (3.x) into it, which still
-      # has `import cgi` in Tempita/_tempita.py.
-      # Patching symlinks does nothing because p4a never calls our python3.
-      #
-      # THE ACTUAL FIX has two parts:
-      #
-      # 1. Patch pip's build-env mechanism so it cannot create a venv with
-      #    Python 3.14. We do this by removing Python 3.14 entirely from
-      #    the system so the only available python/python3/python3.x is 3.10.
-      #
-      # 2. Pre-populate the pip build cache with a patched Cython wheel so
-      #    when pip installs Cython into any fresh venv it gets our version,
-      #    not one downloaded from PyPI.
-      #    We use Cython 3.0.10 which has the `import cgi` bug FIXED
-      #    (the fix landed in Cython 3.0.3 — see Cython issue #5751).
-      # ----------------------------------------------------------------
-
-      - name: Remove system Python 3.14 so p4a cannot create a 3.14 venv
-        run: |
-          echo "=== Python versions before ==="
-          ls /usr/bin/python* 2>/dev/null || true
-          ls /usr/local/bin/python* 2>/dev/null || true
-
-          # Remove deadsnakes / system Python 3.14 if present
-          sudo apt remove -y python3.14 python3.14-minimal python3.14-venv \
-            python3.14-distutils 2>/dev/null || true
-          sudo apt autoremove -y 2>/dev/null || true
-
-          # Also remove the binaries directly in case apt doesn't own them
-          sudo rm -f /usr/bin/python3.14 /usr/local/bin/python3.14
-          sudo rm -f /usr/lib/python3.14 2>/dev/null || true
-
-          # Point system python3 to our 3.10
-          PYTHON310="/opt/hostedtoolcache/Python/3.10.20/x64/bin/python3.10"
-          sudo ln -sf "$PYTHON310" /usr/bin/python3
-          sudo ln -sf "$PYTHON310" /usr/bin/python
-          sudo ln -sf "$PYTHON310" /usr/local/bin/python3
-          sudo ln -sf "$PYTHON310" /usr/local/bin/python
-
-          echo "=== Python versions after ==="
-          ls /usr/bin/python* 2>/dev/null || true
-          python3 --version
-          python --version
-
-          # Confirm 3.14 is gone
-          python3.14 --version 2>/dev/null && echo "WARNING: 3.14 still present" || echo "OK: python3.14 is gone"
-
       - name: Install Python Build Tools
         run: |
           python3 -m pip install --upgrade "pip==23.3.2"
           python3 -m pip install "setuptools==68.2.2" "wheel==0.41.3"
-
-          # Cython 3.0.10: the `import cgi` bug in Tempita was fixed in
-          # 3.0.3 (https://github.com/cython/cython/issues/5751).
-          # We use 3.0.10 (latest stable 3.0.x) which is fully compatible
-          # with Kivy 2.2.1 and has no cgi dependency anywhere.
           python3 -m pip install "Cython==3.0.10"
-
           python3 -m pip install "buildozer==1.5.0"
           python3 -m pip install "python-for-android==2023.05.21"
 
           echo "=== Installed versions ==="
           python3 -m pip show buildozer python-for-android Cython | grep -E "^(Name|Version)"
-          python3 -c "import Cython; print('Cython:', Cython.__version__)"
-
-          # Pre-populate the pip HTTP cache with the Cython wheel so when
-          # p4a's internal venv runs `pip install Cython` it gets a cached
-          # copy instead of resolving to a different version from PyPI.
-          python3 -m pip download "Cython==3.0.10" \
-            --dest /tmp/cython-cache \
-            --no-deps
-          echo "Cached Cython wheel:"
-          ls /tmp/cython-cache/
 
       # ----------------------------------------------------------------
-      # Tell pip (all invocations, including p4a's internal venvs) to
-      # use /tmp/cython-cache as an extra index so it always finds
-      # our pinned Cython 3.0.10 wheel first without going to PyPI.
-      # PIP_FIND_LINKS is honoured by every pip subprocess automatically.
+      # THE DEFINITIVE FIX
+      #
+      # p4a uses pip's build isolation (PEP 517 --isolated mode).
+      # Isolated mode IGNORES all env vars including PIP_FIND_LINKS,
+      # PIP_CONSTRAINT, and PIP_INDEX_URL. It always goes to PyPI
+      # and installs the latest Cython into a fresh /tmp/build-env-*/
+      # using the system Python (3.14 on this runner image).
+      #
+      # The only approach that survives isolated mode is to intercept
+      # pip BEFORE it runs by installing a fake "Cython" package into
+      # the system Python 3.14's site-packages that:
+      #   a) satisfies `pip install Cython` without downloading anything
+      #   b) does not contain the broken _tempita.py with `import cgi`
+      #
+      # We do this by:
+      # 1. Finding where Python 3.14 lives on this runner
+      # 2. Installing our patched Cython directly into its site-packages
+      #    so when pip resolves Cython inside the 3.14 venv it finds it
+      #    already satisfied and skips the download entirely
+      # 3. Also patching every existing _tempita.py on the entire system
+      #    as a belt-and-suspenders measure
       # ----------------------------------------------------------------
-      - name: Export pip environment overrides
+      - name: Patch Cython _tempita.py system-wide (definitive fix)
         run: |
-          echo "PIP_FIND_LINKS=/tmp/cython-cache" >> $GITHUB_ENV
-          # Also constrain Cython so pip never upgrades beyond 3.0.10
-          echo "Cython==3.0.10" > /tmp/pip-constraints.txt
-          echo "PIP_CONSTRAINT=/tmp/pip-constraints.txt" >> $GITHUB_ENV
+          # The broken line in _tempita.py is simply `import cgi` on line 36.
+          # cgi was only used for html-escaping. We replace it with the
+          # html module which has been available since Python 3.2.
+          PATCH_SCRIPT='
+          import sys, os, glob
+
+          FIX_OLD = "import cgi"
+          FIX_NEW = "import html as cgi; cgi.escape = html.escape"
+
+          # Find every _tempita.py anywhere on the system
+          search_roots = ["/usr", "/opt", "/tmp", "/home", "/root"]
+          found = []
+          for root in search_roots:
+              found += glob.glob(f"{root}/**/_tempita.py", recursive=True)
+
+          if not found:
+              print("No _tempita.py files found yet (will be patched post-install)")
+          else:
+              for path in found:
+                  with open(path, "r") as f:
+                      content = f.read()
+                  if FIX_OLD in content and FIX_NEW not in content:
+                      patched = content.replace(FIX_OLD, FIX_NEW)
+                      with open(path, "w") as f:
+                          f.write(patched)
+                      print(f"PATCHED: {path}")
+                  else:
+                      print(f"already ok or not applicable: {path}")
+          '
+          sudo python3 -c "$PATCH_SCRIPT"
+
+          # Additionally: pre-install Cython into EVERY Python version
+          # found on the system so pip's isolated venv sees it as satisfied
+          echo ""
+          echo "=== All python3.x binaries on this system ==="
+          find /usr /opt -name "python3*" -type f 2>/dev/null | grep -v config | sort
+          echo ""
+
+          # Install our Cython into each Python version found
+          for PYBIN in $(find /usr/bin /usr/local/bin /opt -name "python3*" -type f 2>/dev/null | grep -E "python3\.[0-9]+$" | sort -u); do
+            echo "--- Installing Cython into: $PYBIN ($($PYBIN --version 2>&1)) ---"
+            sudo "$PYBIN" -m pip install --quiet "Cython==3.0.10" 2>/dev/null || echo "(skipped: pip not available)"
+          done
+
+          echo ""
+          echo "=== Patching any newly created _tempita.py files ==="
+          sudo python3 -c "$PATCH_SCRIPT"
+
+      # ----------------------------------------------------------------
+      # WRITE A pip.conf THAT APPLIES EVEN IN ISOLATED MODE
+      # pip respects /etc/pip.conf even when --isolated is used for
+      # [global] constraint settings. We use this to add a constraint
+      # pointing at our pre-downloaded Cython wheel.
+      # ----------------------------------------------------------------
+      - name: Write system-wide pip.conf to constrain Cython
+        run: |
+          # Pre-download the Cython wheel to a stable path
+          python3 -m pip download "Cython==3.0.10" \
+            --dest /opt/cython-wheels \
+            --no-deps --quiet
+          echo "Downloaded:"
+          ls /opt/cython-wheels/
+
+          # Write a constraints file
+          echo "Cython==3.0.10" | sudo tee /opt/cython-constraints.txt
+
+          # Write /etc/pip.conf — this is read even in --isolated builds
+          sudo tee /etc/pip.conf > /dev/null << 'EOF'
+          [global]
+          constraint = /opt/cython-constraints.txt
+          find-links = /opt/cython-wheels
+          EOF
+
+          echo "=== /etc/pip.conf ==="
+          cat /etc/pip.conf
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -190,10 +207,35 @@ jobs:
           echo "SDK/NDK cache:"
           ls ~/.buildozer/android/platform/ 2>/dev/null || echo "(empty)"
 
+      # ----------------------------------------------------------------
+      # After the build, if it still fails, patch any NEW _tempita.py
+      # files that were created inside /tmp/build-env-*/ during the run.
+      # We do this by wrapping the build in a script that monitors /tmp.
+      # ----------------------------------------------------------------
       - name: Build debug APK
         run: |
           set -o pipefail
+
+          # Start a background watcher that patches _tempita.py
+          # the instant pip creates it inside any new build-env venv
+          (
+            while true; do
+              for f in $(find /tmp -name "_tempita.py" 2>/dev/null); do
+                if grep -q "^import cgi" "$f" 2>/dev/null; then
+                  sed -i 's/^import cgi$/import html as cgi; cgi.escape = html.escape/' "$f"
+                  echo "[WATCHER] Patched: $f"
+                fi
+              done
+              sleep 0.5
+            done
+          ) &
+          WATCHER_PID=$!
+
           buildozer -v android debug 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+
+          kill $WATCHER_PID 2>/dev/null || true
+          exit $BUILD_EXIT
 
       - name: Upload full build log
         if: always()
@@ -209,7 +251,6 @@ jobs:
           echo "====== LAST 150 LINES OF BUILD LOG ======"
           tail -n 150 build.log || echo "(build.log not found)"
           echo "=========================================="
-          echo ""
           echo "====== ALL ERRORS IN LOG ======"
           grep -i -E "(error|exception|traceback|no module|failed|cannot)" build.log | tail -n 50 || echo "(no matches)"
           echo "================================"
@@ -220,7 +261,7 @@ jobs:
             echo "APK found:"
             ls -lh bin/*.apk
           else
-            echo "ERROR: No APK found. Diagnosing..."
+            echo "ERROR: No APK found."
             ls -la bin/ 2>/dev/null || echo "(bin/ missing)"
             find . -name "*.apk" 2>/dev/null || echo "(no .apk anywhere)"
             exit 1
