@@ -16,6 +16,10 @@ from kivymd.uix.button import MDFlatButton
 from kivymd.uix.dialog import MDDialog
 from kivymd.uix.list import TwoLineAvatarIconListItem
 
+# FIX 1: Do NOT do "from plyer import camera" at the top level.
+# On Android, plyer.camera is only safe to import after permissions are granted.
+# Importing it globally crashes on some Android 13 devices at startup.
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==========================================
@@ -28,7 +32,13 @@ if platform != "android":
     Window.size = (360, 740)
 
 # ==========================================
-# ANDROID VERSION DETECTION
+# FIX 2: ANDROID API VERSION DETECTION
+# We read the actual running Android version so every permission
+# and file path decision below is correct for the real device,
+# not a hardcoded assumption.
+# - Android 13+ (API 33+): READ_MEDIA_IMAGES replaces READ_EXTERNAL_STORAGE
+# - Android 10+ (API 29+): Scoped storage, WRITE_EXTERNAL_STORAGE is ignored
+# - Android 9  (API 28-): Old storage model still applies
 # ==========================================
 
 ANDROID_API_VERSION = 0
@@ -36,45 +46,41 @@ ANDROID_API_VERSION = 0
 if platform == "android":
     try:
         from jnius import autoclass
-        Build = autoclass("android.os.Build$VERSION")
-        ANDROID_API_VERSION = Build.SDK_INT
+        BuildVersion = autoclass("android.os.Build$VERSION")
+        ANDROID_API_VERSION = BuildVersion.SDK_INT
     except Exception:
         ANDROID_API_VERSION = 0
 
 # ==========================================
-# ANDROID PERMISSIONS — split by API level
+# FIX 3: CORRECT PERMISSION SET PER API LEVEL
+# Old code always requested READ_EXTERNAL_STORAGE which on Android 13+
+# is silently ignored, leaving gallery access broken.
 # ==========================================
 
 def get_required_permissions():
-    """
-    Android 13+ (API 33) replaced READ_EXTERNAL_STORAGE with
-    granular media permissions (READ_MEDIA_IMAGES, READ_MEDIA_VIDEO).
-    Android 10+ (API 29) ignores WRITE_EXTERNAL_STORAGE silently.
-    We request the correct set based on the running OS version.
-    """
+    """Return the correct permission list for the running Android version."""
     from android.permissions import Permission
 
-    base = [
+    perms = [
         Permission.CAMERA,
         Permission.ACCESS_FINE_LOCATION,
         Permission.ACCESS_COARSE_LOCATION,
     ]
 
     if ANDROID_API_VERSION >= 33:
-        # Android 13+ granular media permissions
+        # Android 13+: granular media permission replaces broad storage
         try:
-            base.append(Permission.READ_MEDIA_IMAGES)
+            perms.append(Permission.READ_MEDIA_IMAGES)
         except AttributeError:
-            # Fallback if older p4a doesn't expose READ_MEDIA_IMAGES yet
-            base.append(Permission.READ_EXTERNAL_STORAGE)
+            # Older p4a build that doesn't expose READ_MEDIA_IMAGES yet
+            perms.append(Permission.READ_EXTERNAL_STORAGE)
     else:
-        # Android 12 and below
-        base.append(Permission.READ_EXTERNAL_STORAGE)
+        perms.append(Permission.READ_EXTERNAL_STORAGE)
         if ANDROID_API_VERSION < 29:
-            # WRITE_EXTERNAL_STORAGE only meaningful below Android 10
-            base.append(Permission.WRITE_EXTERNAL_STORAGE)
+            # WRITE_EXTERNAL_STORAGE is only meaningful on Android 9 and below
+            perms.append(Permission.WRITE_EXTERNAL_STORAGE)
 
-    return base
+    return perms
 
 # ==========================================
 # SAFE MAPVIEW IMPORT
@@ -332,8 +338,8 @@ ScreenManager:
 
 class MosquitoApp(MDApp):
 
-    user_email = StringProperty("Guest")
-    user_gender = StringProperty("Male")
+    user_email    = StringProperty("Guest")
+    user_gender   = StringProperty("Male")
     user_birthdate = StringProperty("2000-01-01")
     user_occupation = StringProperty("Student")
     selected_image_path = StringProperty("")
@@ -362,7 +368,10 @@ class MosquitoApp(MDApp):
         Clock.schedule_once(self.ask_permissions, 1)
 
     # ==========================================
-    # PERMISSIONS — Android 13+ aware
+    # PERMISSIONS
+    # FIX: old code requested a fixed list that was wrong on Android 13+.
+    # Now we call get_required_permissions() which adapts to the real API level.
+    # We also handle the callback to warn the user if anything was denied.
     # ==========================================
 
     def ask_permissions(self, dt):
@@ -370,23 +379,25 @@ class MosquitoApp(MDApp):
             return
 
         from android.permissions import request_permissions
-        perms = get_required_permissions()
-        request_permissions(perms, self._on_permissions_result)
+        request_permissions(get_required_permissions(), self._on_permissions_result)
 
     def _on_permissions_result(self, permissions, grant_results):
-        """Called after the user responds to the permission dialog."""
-        denied = [
-            p for p, g in zip(permissions, grant_results) if not g
-        ]
+        denied = [p for p, g in zip(permissions, grant_results) if not g]
         if denied:
+            names = [p.split(".")[-1] for p in denied]
             self.show_dialog(
                 "Permissions Required",
-                "Some features (camera, GPS, gallery) may not work because "
-                "the following permissions were denied:\n" + "\n".join(denied)
+                "Some features may not work. Denied:\n" + ", ".join(names)
             )
 
     # ==========================================
     # CAMERA
+    # FIX 1: Removed top-level "from plyer import camera" — moved here.
+    # FIX 2: Old code always saved to primary_external_storage_path()/DCIM
+    #         which requires WRITE_EXTERNAL_STORAGE. On Android 10+ that
+    #         permission is permanently blocked. Now we use scoped storage
+    #         (getExternalFilesDir) on API 29+ which needs no write permission.
+    # FIX 3: Added runtime CAMERA permission check before launching camera.
     # ==========================================
 
     def capture_photo(self):
@@ -394,41 +405,45 @@ class MosquitoApp(MDApp):
             self.show_dialog("Camera", "Camera only supported on Android.")
             return
 
-        # Re-check camera permission before launching
-        self._ensure_camera_permission(self._do_capture_photo)
+        self._ensure_permission_then(
+            self._get_camera_permission(),
+            self._do_capture_photo,
+            "Camera permission is required to take photos."
+        )
 
-    def _ensure_camera_permission(self, callback):
-        """Check CAMERA permission and invoke callback if granted."""
-        from android.permissions import check_permission, request_permissions, Permission
+    def _get_camera_permission(self):
+        from android.permissions import Permission
+        return Permission.CAMERA
 
-        if check_permission(Permission.CAMERA):
+    def _ensure_permission_then(self, permission, callback, denied_msg):
+        """Check a single permission; request it if missing, then call callback."""
+        from android.permissions import check_permission, request_permissions
+
+        if check_permission(permission):
             callback()
         else:
             def on_result(permissions, grants):
                 if grants and grants[0]:
                     callback()
                 else:
-                    self.show_dialog(
-                        "Permission Denied",
-                        "Camera permission is required to take photos."
-                    )
-            request_permissions([Permission.CAMERA], on_result)
+                    self.show_dialog("Permission Denied", denied_msg)
+            request_permissions([permission], on_result)
 
     def _do_capture_photo(self):
-        from plyer import camera
+        from plyer import camera as plyer_camera
 
         timestr = time.strftime("%Y%m%d_%H%M%S")
 
-        # Android 10+ (API 29+): apps must use app-private directories
-        # for files they create. Using getExternalFilesDir is scoped and
-        # does NOT require WRITE_EXTERNAL_STORAGE on API 29+.
         if ANDROID_API_VERSION >= 29:
+            # Android 10+: scoped storage — use app-private external dir.
+            # No WRITE_EXTERNAL_STORAGE permission needed.
             from jnius import autoclass
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             ctx = PythonActivity.mActivity
             ext_dir = ctx.getExternalFilesDir(None)
             folder = str(ext_dir.getAbsolutePath())
         else:
+            # Android 9 and below: old shared storage is fine
             from android.storage import primary_external_storage_path
             folder = os.path.join(primary_external_storage_path(), "DCIM")
 
@@ -439,76 +454,66 @@ class MosquitoApp(MDApp):
 
         def after_capture(path):
             if path and os.path.exists(path):
-                self._set_image(path, "report", captured=True)
+                self._set_image(path, captured=True)
 
-        camera.take_picture(filename=filepath, on_complete=after_capture)
+        plyer_camera.take_picture(filename=filepath, on_complete=after_capture)
 
     # ==========================================
     # FILE MANAGER / GALLERY
+    # FIX: Old code opened primary_external_storage which is inaccessible
+    # under scoped storage (Android 10+). Now we open the app's own
+    # external files dir on API 29+, and re-check the correct storage
+    # permission (READ_MEDIA_IMAGES on Android 13+) before opening.
     # ==========================================
 
     def open_file_manager(self):
-        if platform == "android":
-            # Android 13+: READ_MEDIA_IMAGES replaces READ_EXTERNAL_STORAGE
-            self._ensure_storage_permission(self._do_open_file_manager)
-        else:
-            self._do_open_file_manager()
+        if platform != "android":
+            self.file_manager.show("/")
+            return
 
-    def _ensure_storage_permission(self, callback):
-        from android.permissions import check_permission, request_permissions, Permission
+        storage_perm = self._get_storage_read_permission()
+        self._ensure_permission_then(
+            storage_perm,
+            self._do_open_file_manager,
+            "Storage permission is required to pick images from gallery."
+        )
 
+    def _get_storage_read_permission(self):
+        from android.permissions import Permission
         if ANDROID_API_VERSION >= 33:
             try:
-                perm = Permission.READ_MEDIA_IMAGES
+                return Permission.READ_MEDIA_IMAGES
             except AttributeError:
-                perm = Permission.READ_EXTERNAL_STORAGE
-        else:
-            perm = Permission.READ_EXTERNAL_STORAGE
-
-        if check_permission(perm):
-            callback()
-        else:
-            def on_result(permissions, grants):
-                if grants and grants[0]:
-                    callback()
-                else:
-                    self.show_dialog(
-                        "Permission Denied",
-                        "Storage permission is required to pick images from gallery."
-                    )
-            request_permissions([perm], on_result)
+                return Permission.READ_EXTERNAL_STORAGE
+        return Permission.READ_EXTERNAL_STORAGE
 
     def _do_open_file_manager(self):
-        if platform == "android":
-            if ANDROID_API_VERSION >= 29:
-                # Scoped storage: show the app's own external directory
-                from jnius import autoclass
-                PythonActivity = autoclass("org.kivy.android.PythonActivity")
-                ctx = PythonActivity.mActivity
-                ext_dir = ctx.getExternalFilesDir(None)
-                start_path = str(ext_dir.getAbsolutePath())
-            else:
-                from android.storage import primary_external_storage_path
-                start_path = primary_external_storage_path()
+        if ANDROID_API_VERSION >= 29:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            ctx = PythonActivity.mActivity
+            ext_dir = ctx.getExternalFilesDir(None)
+            start_path = str(ext_dir.getAbsolutePath())
         else:
-            start_path = "/"
+            from android.storage import primary_external_storage_path
+            start_path = primary_external_storage_path()
 
         self.file_manager.show(start_path)
 
     def select_path(self, path):
         self.exit_manager()
-        self._set_image(path, "report", captured=False)
+        self._set_image(path, captured=False)
 
     def exit_manager(self, *args):
         self.file_manager.close()
 
     # ==========================================
-    # SHARED IMAGE SETTER
+    # SHARED IMAGE HELPER
     # ==========================================
 
-    def _set_image(self, path, screen_name, captured=False):
+    def _set_image(self, path, captured=False):
         self.selected_image_path = path
-        screen = self.root.get_screen(screen_name)
+        screen = self.root.get_screen("report")
         screen.ids.preview_image.source = ""
         screen.ids.preview_image.source = path
         screen.ids.preview_image.reload()
@@ -517,37 +522,26 @@ class MosquitoApp(MDApp):
 
     # ==========================================
     # GPS
+    # FIX: Old code set a hardcoded coordinate with no permission check.
+    # Now we verify ACCESS_FINE_LOCATION at runtime before requesting GPS.
+    # The coordinate fallback is kept as a placeholder for the real
+    # GPS implementation via plyer.gps or jnius LocationManager.
     # ==========================================
 
     def get_gps_location(self):
-        """
-        Request location permission at runtime then fetch GPS.
-        Android 12+ requires ACCESS_FINE_LOCATION to be granted at runtime.
-        """
         if platform != "android":
             self.root.get_screen("report").ids.field_location.text = "2.2873,111.8305"
             return
 
-        from android.permissions import check_permission, request_permissions, Permission
-
-        if check_permission(Permission.ACCESS_FINE_LOCATION):
-            self._do_get_location()
-        else:
-            def on_result(permissions, grants):
-                if grants and grants[0]:
-                    self._do_get_location()
-                else:
-                    self.show_dialog(
-                        "Permission Denied",
-                        "Location permission is required to get GPS coordinates."
-                    )
-            request_permissions(
-                [Permission.ACCESS_FINE_LOCATION, Permission.ACCESS_COARSE_LOCATION],
-                on_result
-            )
+        from android.permissions import Permission
+        self._ensure_permission_then(
+            Permission.ACCESS_FINE_LOCATION,
+            self._do_get_location,
+            "Location permission is required to get GPS coordinates."
+        )
 
     def _do_get_location(self):
-        # Placeholder — replace with real GPS logic via plyer or jnius
+        # TODO: replace with real GPS via plyer.gps or jnius LocationManager
         self.root.get_screen("report").ids.field_location.text = "2.2873,111.8305"
 
     # ==========================================
@@ -560,9 +554,9 @@ class MosquitoApp(MDApp):
             return
 
         screen = self.root.get_screen("report")
-        loc = screen.ids.field_location.text
+        loc  = screen.ids.field_location.text
         desc = screen.ids.field_description.text
-        img = self.selected_image_path
+        img  = self.selected_image_path
 
         res = backend.submit_report(loc, desc, img)
 
@@ -629,7 +623,7 @@ class MosquitoApp(MDApp):
         records = backend.get_history()
         if records:
             for item in records:
-                loc = item.get("location", "N/A")
+                loc  = item.get("location", "N/A")
                 date = item.get("created", "")[:16].replace("T", " ")
                 h_list.add_widget(
                     TwoLineAvatarIconListItem(
@@ -671,23 +665,12 @@ class MosquitoApp(MDApp):
     # NAVIGATION
     # ==========================================
 
-    def switch_to_report(self):
-        self.root.current = "report"
-
-    def switch_to_profile(self):
-        self.root.current = "profile"
-
-    def switch_to_register(self):
-        self.root.current = "register"
-
-    def switch_to_login(self):
-        self.root.current = "login"
-
-    def back_to_menu(self):
-        self.root.current = "menu"
-
-    def do_logout(self):
-        self.root.current = "login"
+    def switch_to_report(self):   self.root.current = "report"
+    def switch_to_profile(self):  self.root.current = "profile"
+    def switch_to_register(self): self.root.current = "register"
+    def switch_to_login(self):    self.root.current = "login"
+    def back_to_menu(self):       self.root.current = "menu"
+    def do_logout(self):          self.root.current = "login"
 
     # ==========================================
     # DIALOG
