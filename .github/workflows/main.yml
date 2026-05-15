@@ -63,11 +63,44 @@ jobs:
           echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
           echo "/usr/lib/ccache" >> $GITHUB_PATH
 
+      # ----------------------------------------------------------------
+      # FIX 1: "No module named 'cgi'" — the cgi module was removed in
+      # Python 3.13. The GitHub runner has multiple Python versions
+      # installed system-wide. p4a's subprocess was inheriting the system
+      # python3 (which may be 3.13) instead of the 3.10 we set up.
+      #
+      # Solution: explicitly tell p4a which Python binary to use by
+      # setting PYTHON and PYTHONPATH, and verify what python3 resolves to
+      # before running buildozer.
+      # ----------------------------------------------------------------
+      - name: Verify Python version and fix interpreter
+        run: |
+          echo "=== which python / python3 ==="
+          which python
+          which python3
+          python --version
+          python3 --version
+          echo "=== pip version ==="
+          pip --version
+
+          # Force the PATH-resolved python3 to be our 3.10 by symlinking
+          PYTHON310=$(which python)
+          sudo ln -sf "$PYTHON310" /usr/local/bin/python3
+          sudo ln -sf "$PYTHON310" /usr/local/bin/python
+
+          echo "=== After symlink ==="
+          python3 --version
+          python --version
+
       - name: Install Python Build Tools
         run: |
           pip install --upgrade pip setuptools wheel
+          # Cython 0.29.36 is the last version compatible with Kivy 2.2.1's
+          # .pyx files. Newer Cython changes the API and breaks config.pxi resolution.
           pip install Cython==0.29.36
           pip install buildozer==1.5.0
+          # Verify Cython is correct version
+          python -c "import Cython; print('Cython version:', Cython.__version__)"
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -92,41 +125,49 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-
 
-      - name: Cache p4a build artefacts
-        uses: actions/cache@v4
-        with:
-          path: ~/.buildozer/android/platform/build-*
-          key: p4a-build-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-          restore-keys: |
-            p4a-build-${{ runner.os }}-
-
-      - name: Clean stale app build artefacts
-        run: |
-          rm -rf .buildozer/android/app
-          rm -rf .buildozer/android/platform/build-arm64-v8a
-          rm -rf .buildozer/android/platform/build-armeabi-v7a
-
       # ----------------------------------------------------------------
-      # FIX: The previous workflow piped into tee but never checked if
-      # buildozer itself failed. When using a pipe, the shell reports the
-      # exit code of the LAST command (tee, which always succeeds), not
-      # buildozer. So a failed build looked like a success, no APK was
-      # produced, and only the "Verify APK" step revealed the problem —
-      # with no useful error message.
+      # FIX 2: "config.pxi not resolved" — this is a stale p4a build
+      # cache problem. When a cached build-* directory exists from a
+      # previous failed or mismatched run, p4a's Cython dependency
+      # scanner finds half-compiled .pxi files in the wrong state and
+      # fails to resolve them.
       #
-      # Fix 1: set pipefail so the pipe fails if buildozer fails.
-      # Fix 2: always upload the full build.log so you can read the real
-      #         error even after the job is marked failed.
-      # Fix 3: explicitly check the bin/ directory and print the tail of
-      #         the log right in the Actions console for fast diagnosis.
+      # Solution: do NOT cache the p4a build-* directories at all.
+      # They are architecture-specific compiled C/Cython outputs that
+      # must be built fresh against the exact SDK+NDK+Cython combination.
+      # Only cache the SDK/NDK (which never changes) and pip (small).
       # ----------------------------------------------------------------
+
+      # ----------------------------------------------------------------
+      # FIX 3: Wipe ALL of .buildozer except the SDK/NDK cache.
+      # The previous workflow only deleted build-arm64 and build-armeabi
+      # but left behind .buildozer/android/platform/python-for-android/
+      # which also contains stale .pxi / .pxd files from prior runs.
+      # ----------------------------------------------------------------
+      - name: Clean ALL stale buildozer artefacts (keep SDK/NDK only)
+        run: |
+          # Keep SDK and NDK, wipe everything else buildozer generated
+          rm -rf .buildozer
+
+          # Also clean the global p4a cache which persists between runs
+          # and is the primary source of stale config.pxi errors
+          rm -rf ~/.buildozer/android/platform/build-*
+          rm -rf ~/.buildozer/android/platform/python-for-android
+          rm -rf ~/.buildozer/android/app
+
+          echo "Cleaned. Remaining in ~/.buildozer/android/platform/:"
+          ls ~/.buildozer/android/platform/ 2>/dev/null || echo "(empty — SDK/NDK will be downloaded)"
+
       - name: Build debug APK
+        env:
+          # Force p4a to use our Python 3.10, not any system python3
+          PYTHON: python
+          # Ensure the correct SDK root is visible to buildozer/p4a
+          ANDROID_SDK_ROOT: ${{ github.workspace }}/.buildozer/android/platform/android-sdk
         run: |
           set -o pipefail
           buildozer -v android debug 2>&1 | tee build.log
-          echo "--- Buildozer exit code: $? ---"
 
-      # Always runs — gives you the log even on success, so you can read it
       - name: Upload full build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -135,40 +176,34 @@ jobs:
           path: build.log
           retention-days: 7
 
-      # Runs only on failure — prints the last 100 lines of the log
-      # directly in the Actions console so you see the real error immediately
       - name: Print tail of build log on failure
         if: failure()
         run: |
-          echo "====== LAST 100 LINES OF BUILD LOG ======"
-          tail -n 100 build.log || echo "(build.log not found)"
+          echo "====== LAST 150 LINES OF BUILD LOG ======"
+          tail -n 150 build.log || echo "(build.log not found)"
           echo "=========================================="
           echo ""
-          echo "====== ERRORS AND EXCEPTIONS ======"
-          grep -i -E "(error|exception|traceback|failed|no such)" build.log | tail -n 40 || echo "(no matches)"
-          echo "==================================="
+          echo "====== ALL ERRORS IN LOG ======"
+          grep -i -E "(error|exception|traceback|no module|failed|cannot)" build.log | tail -n 50 || echo "(no matches)"
+          echo "================================"
 
       - name: Verify APK was produced
         run: |
-          mkdir -p bin
           if ls bin/*.apk 1>/dev/null 2>&1; then
             echo "APK found:"
             ls -lh bin/*.apk
           else
-            echo "ERROR: No APK in bin/. Listing workspace to help diagnose:"
-            echo "--- bin/ contents ---"
-            ls -la bin/ || echo "(bin/ is empty or missing)"
-            echo "--- .buildozer/android/app/ ---"
-            ls -la .buildozer/android/app/ 2>/dev/null || echo "(directory missing)"
-            echo "--- Find any .apk anywhere ---"
-            find . -name "*.apk" 2>/dev/null || echo "(none found)"
+            echo "ERROR: No APK found. Diagnosing..."
+            echo "--- bin/ ---"
+            ls -la bin/ 2>/dev/null || echo "(missing)"
+            echo "--- find .apk ---"
+            find . -name "*.apk" 2>/dev/null || echo "(none)"
             exit 1
           fi
 
-      - name: Show APK min/target SDK
+      - name: Show APK SDK versions
         run: |
           APK=$(ls bin/*.apk | head -1)
-          echo "Checking: $APK"
           aapt dump badging "$APK" | grep -E "sdkVersion|targetSdkVersion|package"
 
       - name: Upload APK artifact
