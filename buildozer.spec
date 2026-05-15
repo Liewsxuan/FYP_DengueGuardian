@@ -12,7 +12,7 @@ version = 1.0
 # ---------------------------------------------------------------
 # REQUIREMENTS
 # ---------------------------------------------------------------
-requirements = python3==3.10.11,kivy==2.2.1,kivymd==1.1.1,requests,urllib3,certifi,charset-normalizer,idna,plyer,pillow,mapview
+requirements = python3,kivy==2.2.1,kivymd==1.1.1,requests,urllib3,certifi,charset-normalizer,idna,plyer,pillow,mapview
 
 orientation = portrait
 fullscreen = 0
