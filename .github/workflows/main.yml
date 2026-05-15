@@ -83,13 +83,10 @@ jobs:
           # Kivy 2.2.1 is more stable with Cython 0.29.x
           python -m pip install Cython==0.29.36
 
-          python -m pip install \
-            buildozer==1.5.0 \
-            python-for-android==2023.09.16
+          python -m pip install buildozer==1.5.0 \
 
           echo "=== INSTALLED ==="
           python -m pip show buildozer
-          python -m pip show python-for-android
           python -m pip show Cython
 
       # =========================================================
@@ -160,9 +157,6 @@ jobs:
       # =========================================================
 
       - name: Build APK
-        env:
-          PIP_NO_BUILD_ISOLATION: "1"
-          PIP_USE_PEP517: "0"
         run: |
           buildozer android debug
 
