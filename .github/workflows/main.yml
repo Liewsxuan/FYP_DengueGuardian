@@ -13,6 +13,10 @@ jobs:
     steps:
       - name: Checkout Source
         uses: actions/checkout@v4
+        
+      - name: Clean Buildozer
+        run: |
+          rm -rf .buildozer
 
       # =========================================================
       # PYTHON 3.10
@@ -76,9 +80,9 @@ jobs:
           python -m pip install --upgrade pip==23.3.2
       
           python -m pip install \
-            setuptools==68.2.2 \
-            wheel==0.41.3 \
-            Cython==0.29.36 \
+          setuptools==68.2.2 \
+          wheel==0.41.3 \
+          Cython==0.29.36 \
 
           # IMPORTANT:
           # Kivy 2.2.1 is more stable with Cython 0.29.x
