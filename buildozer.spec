@@ -35,7 +35,6 @@ android.api = 34
 android.minapi = 21
 android.ndk = 25b
 android.ndk_api = 21
-android.sdk = 34
 
 android.accept_sdk_license = True
 android.enable_androidx = True
