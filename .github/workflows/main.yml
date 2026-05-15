@@ -59,10 +59,18 @@ jobs:
             lld \
             aapt
 
-      - name: Set JAVA_HOME to Java 17
+      # ----------------------------------------------------------------
+      # FIX: Set JAVA_HOME and prepend to PATH using $GITHUB_ENV and
+      # $GITHUB_PATH files — the ONLY correct way in GitHub Actions.
+      # Using ${{ env.PATH }} inside an env: block is invalid syntax;
+      # it resolves to an empty string, which breaks PATH entirely and
+      # causes ANY command to fail with exit code 127 ("not found").
+      # ----------------------------------------------------------------
+      - name: Set JAVA_HOME and PATH
         run: |
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
           echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
+          echo "/usr/lib/ccache" >> $GITHUB_PATH
 
       - name: Install Python Build Tools
         run: |
@@ -72,7 +80,7 @@ jobs:
           # Do NOT pin python-for-android separately.
           # buildozer 1.5.0 resolves and installs the correct compatible version.
 
-      - name: Set up ccache (speeds up repeated C/C++ compilation)
+      - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: android-ccache-${{ runner.os }}
@@ -103,26 +111,27 @@ jobs:
           restore-keys: |
             p4a-build-${{ runner.os }}-
 
-      - name: Clean stale .buildozer folder (local artefacts only, not SDK/NDK)
+      - name: Clean stale app build artefacts
         run: |
-          # Remove only the compiled app artefacts, not the downloaded SDK/NDK
           rm -rf .buildozer/android/app
           rm -rf .buildozer/android/platform/build-arm64-v8a
           rm -rf .buildozer/android/platform/build-armeabi-v7a
 
+      # ----------------------------------------------------------------
+      # FIX: No env: block here at all. JAVA_HOME and ccache PATH were
+      # already exported via $GITHUB_ENV / $GITHUB_PATH above and are
+      # automatically available to every subsequent step — no need to
+      # re-declare them, and re-declaring with ${{ env.PATH }} breaks
+      # everything.
+      # ----------------------------------------------------------------
       - name: Build debug APK
-        env:
-          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
-          PATH: /usr/lib/jvm/java-17-openjdk-amd64/bin:/usr/lib/ccache:${{ env.PATH }}
-          # Accept Android SDK licences non-interactively
-          ANDROID_SDK_ROOT: ${{ github.workspace }}/.buildozer/android/platform/android-sdk
         run: |
           buildozer -v android debug 2>&1 | tee build.log
 
       - name: Verify APK was produced
         run: |
           ls -lh bin/*.apk
-          echo "✅ APK build succeeded"
+          echo "APK build succeeded"
 
       - name: Show APK min/target SDK (sanity check)
         run: |
