@@ -47,12 +47,6 @@ android.archs = arm64-v8a, armeabi-v7a
 # AndroidX libraries needed for modern file access and activity result APIs
 android.gradle_dependencies = androidx.activity:activity:1.7.2,androidx.core:core:1.10.1
 
-# ---------------------------------------------------------------
-# P4A
-# ---------------------------------------------------------------
-p4a.url = https://github.com/kivy/python-for-android/archive/refs/tags/2023.05.21.zip
-p4a.bootstrap = sdl2
-
 [buildozer]
 
 log_level = 2
