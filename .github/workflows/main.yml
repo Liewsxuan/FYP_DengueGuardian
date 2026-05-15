@@ -1,3 +1,4 @@
+```yaml
 name: Build APK
 
 on:
@@ -14,20 +15,26 @@ jobs:
       - name: Checkout Source
         uses: actions/checkout@v4
 
+      # =========================================================
+      # PYTHON 3.10
+      # =========================================================
+
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
+      # =========================================================
+      # SYSTEM DEPENDENCIES
+      # =========================================================
+
       - name: Install System Dependencies
         run: |
           sudo apt update
+
           sudo apt install -y \
             zip unzip \
             openjdk-17-jdk \
-            python3-pip \
-            build-essential \
-            git \
             autoconf \
             libtool \
             pkg-config \
@@ -45,79 +52,80 @@ jobs:
             libgdbm-dev \
             liblzma-dev \
             tk-dev \
-            libsdl2-dev \
-            libsdl2-image-dev \
-            libsdl2-mixer-dev \
-            libsdl2-ttf-dev \
-            libportmidi-dev \
-            libswscale-dev \
-            libavformat-dev \
-            libavcodec-dev \
+            build-essential \
+            git \
             ccache \
             lld \
             aapt
 
-      - name: Set JAVA_HOME and PATH
+      # =========================================================
+      # JAVA
+      # =========================================================
+
+      - name: Set JAVA_HOME
         run: |
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
           echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
           echo "/usr/lib/ccache" >> $GITHUB_PATH
 
-      - name: Install Python build tools
+      # =========================================================
+      # PYTHON TOOLS
+      # =========================================================
+
+      - name: Install Python Build Tools
         run: |
-          python3 -m pip install --upgrade "pip==23.3.2"
-          python3 -m pip install "setuptools==68.2.2" "wheel==0.41.3"
-          python3 -m pip install "Cython==3.0.10"
-          python3 -m pip install "buildozer==1.5.0"
-          python3 -m pip install "python-for-android==2023.05.21"
+          python -m pip install --upgrade pip==23.3.2
 
-          echo "=== Versions ==="
-          python3 -m pip show buildozer python-for-android Cython | grep -E "^(Name|Version)"
+          python -m pip install \
+            setuptools==68.2.2 \
+            wheel==0.41.3
 
-      # ----------------------------------------------------------------
-      # FIX for "No module named 'cgi'"
-      #
-      # pip's PEP 517 build isolation creates /tmp/build-env-XXXX/ using
-      # the system Python 3.14, installs Cython there, then Cython's
-      # _tempita.py crashes with `import cgi` (removed in Python 3.13+).
-      #
-      # APPROACH:
-      # 1. Pre-install Cython 3.0.10 into all Python versions — only
-      #    scanning known safe directories (NOT / which takes 20+ minutes)
-      # 2. Write /etc/pip.conf with constraints (read even in --isolated)
-      # 3. Background watcher during build: patch /tmp/build-env-* only,
-      #    which is the ONLY place pip creates isolated build envs
-      # ----------------------------------------------------------------
+          # IMPORTANT:
+          # Kivy 2.2.1 is more stable with Cython 0.29.x
+          python -m pip install Cython==0.29.36
 
-      - name: Layer 1 — Pre-install Cython into all system Pythons
+          python -m pip install \
+            buildozer==1.5.0 \
+            python-for-android==2023.09.16
+
+          echo "=== INSTALLED ==="
+          python -m pip show buildozer
+          python -m pip show python-for-android
+          python -m pip show Cython
+
+      # =========================================================
+      # PATCH CYTHON CGI ISSUE
+      # =========================================================
+
+      - name: Patch Cython cgi issue
         run: |
-          # ONLY search known Python binary locations — never scan from /
-          SEARCH_DIRS="/usr/bin /usr/local/bin /opt/hostedtoolcache"
-          echo "=== Python binaries found ==="
-          find $SEARCH_DIRS -name "python3*" -type f 2>/dev/null \
-            | grep -E "python3\.[0-9]+$" | sort -u
+          python - << 'PY'
+          import pathlib
+          import site
 
-          for PYBIN in $(find $SEARCH_DIRS -name "python3*" -type f 2>/dev/null \
-                         | grep -E "python3\.[0-9]+$" | sort -u); do
-            VER=$("$PYBIN" --version 2>&1 || echo "unknown")
-            echo "--- Installing Cython into $PYBIN ($VER) ---"
-            sudo "$PYBIN" -m pip install --quiet "Cython==3.0.10" 2>/dev/null \
-              && echo "  OK" || echo "  (no pip, skipped)"
-          done
+          patched = False
 
-      - name: Layer 2 — Write /etc/pip.conf (survives --isolated mode)
-        run: |
-          python3 -m pip download "Cython==3.0.10" \
-            --dest /opt/cython-wheels --no-deps --quiet
-          echo "Cython==3.0.10" | sudo tee /opt/cython-constraints.txt > /dev/null
+          for sp in site.getsitepackages():
+              for f in pathlib.Path(sp).rglob("_tempita.py"):
+                  txt = f.read_text()
 
-          sudo tee /etc/pip.conf > /dev/null << 'EOF'
-          [global]
-          constraint = /opt/cython-constraints.txt
-          find-links = /opt/cython-wheels
-          EOF
-          echo "=== /etc/pip.conf ==="
-          cat /etc/pip.conf
+                  if "import cgi" in txt:
+                      txt = txt.replace(
+                          "import cgi",
+                          "import html as cgi\ncgi.escape = html.escape"
+                      )
+
+                      f.write_text(txt)
+
+                      print("PATCHED:", f)
+                      patched = True
+
+          print("DONE:", patched)
+          PY
+
+      # =========================================================
+      # CACHE
+      # =========================================================
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -130,102 +138,78 @@ jobs:
           path: |
             ~/.buildozer/android/platform/android-sdk
             ~/.buildozer/android/platform/android-ndk-r25b
-          key: android-sdk-ndk-${{ runner.os }}-api34-ndk25b
-          restore-keys: |
-            android-sdk-ndk-${{ runner.os }}-
+          key: android-sdk-ndk-${{ runner.os }}-api34
 
-      - name: Cache pip downloads
+      - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
-          restore-keys: |
-            pip-${{ runner.os }}-
 
-      - name: Clean all stale buildozer artefacts
+      # =========================================================
+      # CLEAN
+      # =========================================================
+
+      - name: Clean old buildozer files
         run: |
           rm -rf .buildozer
           rm -rf ~/.buildozer/android/platform/build-*
-          rm -rf ~/.buildozer/android/platform/python-for-android
           rm -rf ~/.buildozer/android/app
-          echo "SDK/NDK cache:"
-          ls ~/.buildozer/android/platform/ 2>/dev/null || echo "(empty)"
 
-      - name: Layer 3 — Build APK with /tmp watcher
+      # =========================================================
+      # BUILD APK
+      # =========================================================
+
+      - name: Build APK
+        env:
+          PIP_NO_BUILD_ISOLATION: "1"
+          PIP_USE_PEP517: "0"
         run: |
-          set -o pipefail
+          buildozer android debug
 
-          # Patch _tempita.py files ONLY inside /tmp (where pip puts
-          # isolated build envs). Never scan the whole filesystem.
-          patch_tmp() {
-            find /tmp -name "_tempita.py" 2>/dev/null | while read -r f; do
-              if grep -q "^import cgi" "$f" 2>/dev/null; then
-                sed -i \
-                  's/^import cgi$/import html as cgi; cgi.escape = html.escape/' \
-                  "$f" && echo "[WATCHER] Patched: $f"
-              fi
-            done
-          }
+      # =========================================================
+      # SHOW LOGS IF FAILED
+      # =========================================================
 
-          # Patch anything already in /tmp right now
-          patch_tmp
-
-          # Background watcher — checks /tmp every 0.3s during build
-          (
-            while true; do
-              patch_tmp
-              sleep 0.3
-            done
-          ) &
-          WATCHER_PID=$!
-          echo "Watcher started (PID $WATCHER_PID), monitoring /tmp only"
-
-          buildozer -v android debug 2>&1 | tee build.log
-          BUILD_EXIT=${PIPESTATUS[0]}
-
-          kill $WATCHER_PID 2>/dev/null || true
-          wait $WATCHER_PID 2>/dev/null || true
-
-          exit $BUILD_EXIT
-
-      - name: Upload full build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
-          retention-days: 7
-
-      - name: Print tail of build log on failure
+      - name: Show Buildozer Logs
         if: failure()
         run: |
-          echo "====== LAST 150 LINES ======"
-          tail -n 150 build.log || echo "(not found)"
-          echo "====== ALL ERRORS ======"
-          grep -i -E "(error|exception|traceback|no module|failed|cannot)" \
-            build.log | tail -n 50 || echo "(no matches)"
+          echo "========= BUILDOZER LOGS ========="
 
-      - name: Verify APK was produced
+          find .buildozer -name "*.log" 2>/dev/null
+
+          echo "========= LAST 200 LINES ========="
+
+          find .buildozer -name "*.log" | while read f; do
+            echo "----- $f -----"
+            tail -n 200 "$f"
+          done
+
+      # =========================================================
+      # VERIFY APK
+      # =========================================================
+
+      - name: Verify APK Exists
         run: |
-          if ls bin/*.apk 1>/dev/null 2>&1; then
-            echo "APK found:"
-            ls -lh bin/*.apk
-          else
-            echo "ERROR: No APK found."
-            ls -la bin/ 2>/dev/null || echo "(bin/ missing)"
-            find . -name "*.apk" 2>/dev/null || echo "(none)"
+          ls -lah bin/
+
+          APK=$(find bin -name "*.apk" | head -1)
+
+          if [ -z "$APK" ]; then
+            echo "APK NOT FOUND"
             exit 1
           fi
 
-      - name: Show APK SDK versions
-        run: |
-          APK=$(ls bin/*.apk | head -1)
-          aapt dump badging "$APK" | grep -E "sdkVersion|targetSdkVersion|package"
+          echo "APK FOUND:"
+          echo "$APK"
 
-      - name: Upload APK artifact
+      # =========================================================
+      # UPLOAD APK
+      # =========================================================
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: DengueGuardian-debug-apk
+          name: DengueGuardian-APK
           path: bin/*.apk
-          if-no-files-found: error
-          retention-days: 30
+```
