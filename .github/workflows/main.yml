@@ -63,7 +63,7 @@ jobs:
           echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
           echo "/usr/lib/ccache" >> $GITHUB_PATH
 
-      - name: Install Python Build Tools
+      - name: Install Python build tools
         run: |
           python3 -m pip install --upgrade "pip==23.3.2"
           python3 -m pip install "setuptools==68.2.2" "wheel==0.41.3"
@@ -71,107 +71,51 @@ jobs:
           python3 -m pip install "buildozer==1.5.0"
           python3 -m pip install "python-for-android==2023.05.21"
 
-          echo "=== Installed versions ==="
+          echo "=== Versions ==="
           python3 -m pip show buildozer python-for-android Cython | grep -E "^(Name|Version)"
 
       # ----------------------------------------------------------------
-      # THE DEFINITIVE FIX
+      # FIX for "No module named 'cgi'"
       #
-      # p4a uses pip's build isolation (PEP 517 --isolated mode).
-      # Isolated mode IGNORES all env vars including PIP_FIND_LINKS,
-      # PIP_CONSTRAINT, and PIP_INDEX_URL. It always goes to PyPI
-      # and installs the latest Cython into a fresh /tmp/build-env-*/
-      # using the system Python (3.14 on this runner image).
+      # pip's PEP 517 build isolation creates /tmp/build-env-XXXX/ using
+      # the system Python 3.14, installs Cython there, then Cython's
+      # _tempita.py crashes with `import cgi` (removed in Python 3.13+).
       #
-      # The only approach that survives isolated mode is to intercept
-      # pip BEFORE it runs by installing a fake "Cython" package into
-      # the system Python 3.14's site-packages that:
-      #   a) satisfies `pip install Cython` without downloading anything
-      #   b) does not contain the broken _tempita.py with `import cgi`
-      #
-      # We do this by:
-      # 1. Finding where Python 3.14 lives on this runner
-      # 2. Installing our patched Cython directly into its site-packages
-      #    so when pip resolves Cython inside the 3.14 venv it finds it
-      #    already satisfied and skips the download entirely
-      # 3. Also patching every existing _tempita.py on the entire system
-      #    as a belt-and-suspenders measure
+      # APPROACH:
+      # 1. Pre-install Cython 3.0.10 into all Python versions — only
+      #    scanning known safe directories (NOT / which takes 20+ minutes)
+      # 2. Write /etc/pip.conf with constraints (read even in --isolated)
+      # 3. Background watcher during build: patch /tmp/build-env-* only,
+      #    which is the ONLY place pip creates isolated build envs
       # ----------------------------------------------------------------
-      - name: Patch Cython _tempita.py system-wide (definitive fix)
+
+      - name: Layer 1 — Pre-install Cython into all system Pythons
         run: |
-          # The broken line in _tempita.py is simply `import cgi` on line 36.
-          # cgi was only used for html-escaping. We replace it with the
-          # html module which has been available since Python 3.2.
-          PATCH_SCRIPT='
-          import sys, os, glob
+          # ONLY search known Python binary locations — never scan from /
+          SEARCH_DIRS="/usr/bin /usr/local/bin /opt/hostedtoolcache"
+          echo "=== Python binaries found ==="
+          find $SEARCH_DIRS -name "python3*" -type f 2>/dev/null \
+            | grep -E "python3\.[0-9]+$" | sort -u
 
-          FIX_OLD = "import cgi"
-          FIX_NEW = "import html as cgi; cgi.escape = html.escape"
-
-          # Find every _tempita.py anywhere on the system
-          search_roots = ["/usr", "/opt", "/tmp", "/home", "/root"]
-          found = []
-          for root in search_roots:
-              found += glob.glob(f"{root}/**/_tempita.py", recursive=True)
-
-          if not found:
-              print("No _tempita.py files found yet (will be patched post-install)")
-          else:
-              for path in found:
-                  with open(path, "r") as f:
-                      content = f.read()
-                  if FIX_OLD in content and FIX_NEW not in content:
-                      patched = content.replace(FIX_OLD, FIX_NEW)
-                      with open(path, "w") as f:
-                          f.write(patched)
-                      print(f"PATCHED: {path}")
-                  else:
-                      print(f"already ok or not applicable: {path}")
-          '
-          sudo python3 -c "$PATCH_SCRIPT"
-
-          # Additionally: pre-install Cython into EVERY Python version
-          # found on the system so pip's isolated venv sees it as satisfied
-          echo ""
-          echo "=== All python3.x binaries on this system ==="
-          find /usr /opt -name "python3*" -type f 2>/dev/null | grep -v config | sort
-          echo ""
-
-          # Install our Cython into each Python version found
-          for PYBIN in $(find /usr/bin /usr/local/bin /opt -name "python3*" -type f 2>/dev/null | grep -E "python3\.[0-9]+$" | sort -u); do
-            echo "--- Installing Cython into: $PYBIN ($($PYBIN --version 2>&1)) ---"
-            sudo "$PYBIN" -m pip install --quiet "Cython==3.0.10" 2>/dev/null || echo "(skipped: pip not available)"
+          for PYBIN in $(find $SEARCH_DIRS -name "python3*" -type f 2>/dev/null \
+                         | grep -E "python3\.[0-9]+$" | sort -u); do
+            VER=$("$PYBIN" --version 2>&1 || echo "unknown")
+            echo "--- Installing Cython into $PYBIN ($VER) ---"
+            sudo "$PYBIN" -m pip install --quiet "Cython==3.0.10" 2>/dev/null \
+              && echo "  OK" || echo "  (no pip, skipped)"
           done
 
-          echo ""
-          echo "=== Patching any newly created _tempita.py files ==="
-          sudo python3 -c "$PATCH_SCRIPT"
-
-      # ----------------------------------------------------------------
-      # WRITE A pip.conf THAT APPLIES EVEN IN ISOLATED MODE
-      # pip respects /etc/pip.conf even when --isolated is used for
-      # [global] constraint settings. We use this to add a constraint
-      # pointing at our pre-downloaded Cython wheel.
-      # ----------------------------------------------------------------
-      - name: Write system-wide pip.conf to constrain Cython
+      - name: Layer 2 — Write /etc/pip.conf (survives --isolated mode)
         run: |
-          # Pre-download the Cython wheel to a stable path
           python3 -m pip download "Cython==3.0.10" \
-            --dest /opt/cython-wheels \
-            --no-deps --quiet
-          echo "Downloaded:"
-          ls /opt/cython-wheels/
+            --dest /opt/cython-wheels --no-deps --quiet
+          echo "Cython==3.0.10" | sudo tee /opt/cython-constraints.txt > /dev/null
 
-          # Write a constraints file
-          echo "Cython==3.0.10" | sudo tee /opt/cython-constraints.txt
-
-          # Write /etc/pip.conf — this is read even in --isolated builds
           sudo tee /etc/pip.conf > /dev/null << 'EOF'
           [global]
           constraint = /opt/cython-constraints.txt
           find-links = /opt/cython-wheels
           EOF
-
           echo "=== /etc/pip.conf ==="
           cat /etc/pip.conf
 
@@ -207,34 +151,41 @@ jobs:
           echo "SDK/NDK cache:"
           ls ~/.buildozer/android/platform/ 2>/dev/null || echo "(empty)"
 
-      # ----------------------------------------------------------------
-      # After the build, if it still fails, patch any NEW _tempita.py
-      # files that were created inside /tmp/build-env-*/ during the run.
-      # We do this by wrapping the build in a script that monitors /tmp.
-      # ----------------------------------------------------------------
-      - name: Build debug APK
+      - name: Layer 3 — Build APK with /tmp watcher
         run: |
           set -o pipefail
 
-          # Start a background watcher that patches _tempita.py
-          # the instant pip creates it inside any new build-env venv
+          # Patch _tempita.py files ONLY inside /tmp (where pip puts
+          # isolated build envs). Never scan the whole filesystem.
+          patch_tmp() {
+            find /tmp -name "_tempita.py" 2>/dev/null | while read -r f; do
+              if grep -q "^import cgi" "$f" 2>/dev/null; then
+                sed -i \
+                  's/^import cgi$/import html as cgi; cgi.escape = html.escape/' \
+                  "$f" && echo "[WATCHER] Patched: $f"
+              fi
+            done
+          }
+
+          # Patch anything already in /tmp right now
+          patch_tmp
+
+          # Background watcher — checks /tmp every 0.3s during build
           (
             while true; do
-              for f in $(find /tmp -name "_tempita.py" 2>/dev/null); do
-                if grep -q "^import cgi" "$f" 2>/dev/null; then
-                  sed -i 's/^import cgi$/import html as cgi; cgi.escape = html.escape/' "$f"
-                  echo "[WATCHER] Patched: $f"
-                fi
-              done
-              sleep 0.5
+              patch_tmp
+              sleep 0.3
             done
           ) &
           WATCHER_PID=$!
+          echo "Watcher started (PID $WATCHER_PID), monitoring /tmp only"
 
           buildozer -v android debug 2>&1 | tee build.log
           BUILD_EXIT=${PIPESTATUS[0]}
 
           kill $WATCHER_PID 2>/dev/null || true
+          wait $WATCHER_PID 2>/dev/null || true
+
           exit $BUILD_EXIT
 
       - name: Upload full build log
@@ -248,12 +199,11 @@ jobs:
       - name: Print tail of build log on failure
         if: failure()
         run: |
-          echo "====== LAST 150 LINES OF BUILD LOG ======"
-          tail -n 150 build.log || echo "(build.log not found)"
-          echo "=========================================="
-          echo "====== ALL ERRORS IN LOG ======"
-          grep -i -E "(error|exception|traceback|no module|failed|cannot)" build.log | tail -n 50 || echo "(no matches)"
-          echo "================================"
+          echo "====== LAST 150 LINES ======"
+          tail -n 150 build.log || echo "(not found)"
+          echo "====== ALL ERRORS ======"
+          grep -i -E "(error|exception|traceback|no module|failed|cannot)" \
+            build.log | tail -n 50 || echo "(no matches)"
 
       - name: Verify APK was produced
         run: |
@@ -263,7 +213,7 @@ jobs:
           else
             echo "ERROR: No APK found."
             ls -la bin/ 2>/dev/null || echo "(bin/ missing)"
-            find . -name "*.apk" 2>/dev/null || echo "(no .apk anywhere)"
+            find . -name "*.apk" 2>/dev/null || echo "(none)"
             exit 1
           fi
 
