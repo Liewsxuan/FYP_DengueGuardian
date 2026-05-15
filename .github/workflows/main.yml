@@ -50,7 +50,7 @@ jobs:
             libsdl2-mixer-dev \
             libsdl2-ttf-dev \
             libportmidi-dev \
-            libswscave-dev \
+            libswscale-dev \
             libavformat-dev \
             libavcodec-dev \
             ccache \
@@ -64,64 +64,40 @@ jobs:
           echo "/usr/lib/ccache" >> $GITHUB_PATH
 
       # ----------------------------------------------------------------
-      # ROOT CAUSE FIX
-      #
-      # The traceback shows:
-      #   /tmp/build-env-4mmaj4wc/lib/python3.14/site-packages/Cython/...
-      #
-      # p4a internally calls `pip install` inside a fresh temp virtualenv.
-      # It creates that venv by running the system `python3` binary —
-      # NOT the GitHub Actions-managed Python 3.10.
-      #
-      # On ubuntu-22.04 runners as of 2025, the system python3 resolves
-      # to Python 3.14 (installed by deadsnakes or another tool in the
-      # runner image). Python 3.14 has no `cgi` module, so Cython's
-      # Tempita (used during wheel building) crashes immediately.
-      #
-      # The only reliable fix is to REPLACE the system python3 symlink
-      # so that any process — including p4a's internal venv creation —
-      # gets Python 3.10 when it calls `python3`.
+      # ROOT CAUSE FIX: p4a creates internal temp venvs using the system
+      # python3, which on this runner is Python 3.14 (no `cgi` module).
+      # We replace all python3/python symlinks with our 3.10 binary so
+      # every subprocess p4a spawns gets the correct Python version.
       # ----------------------------------------------------------------
       - name: Force system python3 → Python 3.10
         run: |
           PYTHON310="/opt/hostedtoolcache/Python/3.10.20/x64/bin/python3.10"
 
           echo "Before fix:"
-          ls -la /usr/bin/python3* 2>/dev/null || true
           python3 --version || true
 
-          # Replace every system python3 entry point with our 3.10
           sudo ln -sf "$PYTHON310" /usr/bin/python3
           sudo ln -sf "$PYTHON310" /usr/bin/python
           sudo ln -sf "$PYTHON310" /usr/local/bin/python3
           sudo ln -sf "$PYTHON310" /usr/local/bin/python
-
-          # Also update /usr/bin/python3 alternatives if present
           sudo update-alternatives --install /usr/bin/python3 python3 "$PYTHON310" 100 2>/dev/null || true
           sudo update-alternatives --set python3 "$PYTHON310" 2>/dev/null || true
 
-          echo ""
           echo "After fix:"
           python3 --version
           python --version
-          which python3
-          which python
 
       - name: Install Python Build Tools
         run: |
-          # Use our forced 3.10 for all pip installs
           python3 -m pip install --upgrade "pip==23.3.2"
           python3 -m pip install "setuptools==68.2.2" "wheel==0.41.3"
           python3 -m pip install "Cython==0.29.36"
           python3 -m pip install "buildozer==1.5.0"
           python3 -m pip install "python-for-android==2023.05.21"
 
-          echo ""
-          echo "=== Installed package versions ==="
+          echo "=== Installed versions ==="
           python3 -m pip show buildozer python-for-android Cython | grep -E "^(Name|Version)"
-          echo ""
-          echo "=== Final python3 check ==="
-          python3 --version
+          echo "=== Python check ==="
           python3 -c "import sys; print('sys.version:', sys.version)"
           python3 -c "import Cython; print('Cython:', Cython.__version__)"
 
