@@ -17,8 +17,6 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          # Python 3.10 is required — Cython 0.29.36 + buildozer 1.5.0
-          # have known issues with 3.11+
           python-version: "3.10"
 
       - name: Install System Dependencies
@@ -59,13 +57,6 @@ jobs:
             lld \
             aapt
 
-      # ----------------------------------------------------------------
-      # FIX: Set JAVA_HOME and prepend to PATH using $GITHUB_ENV and
-      # $GITHUB_PATH files — the ONLY correct way in GitHub Actions.
-      # Using ${{ env.PATH }} inside an env: block is invalid syntax;
-      # it resolves to an empty string, which breaks PATH entirely and
-      # causes ANY command to fail with exit code 127 ("not found").
-      # ----------------------------------------------------------------
       - name: Set JAVA_HOME and PATH
         run: |
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
@@ -77,8 +68,6 @@ jobs:
           pip install --upgrade pip setuptools wheel
           pip install Cython==0.29.36
           pip install buildozer==1.5.0
-          # Do NOT pin python-for-android separately.
-          # buildozer 1.5.0 resolves and installs the correct compatible version.
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -118,25 +107,69 @@ jobs:
           rm -rf .buildozer/android/platform/build-armeabi-v7a
 
       # ----------------------------------------------------------------
-      # FIX: No env: block here at all. JAVA_HOME and ccache PATH were
-      # already exported via $GITHUB_ENV / $GITHUB_PATH above and are
-      # automatically available to every subsequent step — no need to
-      # re-declare them, and re-declaring with ${{ env.PATH }} breaks
-      # everything.
+      # FIX: The previous workflow piped into tee but never checked if
+      # buildozer itself failed. When using a pipe, the shell reports the
+      # exit code of the LAST command (tee, which always succeeds), not
+      # buildozer. So a failed build looked like a success, no APK was
+      # produced, and only the "Verify APK" step revealed the problem —
+      # with no useful error message.
+      #
+      # Fix 1: set pipefail so the pipe fails if buildozer fails.
+      # Fix 2: always upload the full build.log so you can read the real
+      #         error even after the job is marked failed.
+      # Fix 3: explicitly check the bin/ directory and print the tail of
+      #         the log right in the Actions console for fast diagnosis.
       # ----------------------------------------------------------------
       - name: Build debug APK
         run: |
+          set -o pipefail
           buildozer -v android debug 2>&1 | tee build.log
+          echo "--- Buildozer exit code: $? ---"
+
+      # Always runs — gives you the log even on success, so you can read it
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
+
+      # Runs only on failure — prints the last 100 lines of the log
+      # directly in the Actions console so you see the real error immediately
+      - name: Print tail of build log on failure
+        if: failure()
+        run: |
+          echo "====== LAST 100 LINES OF BUILD LOG ======"
+          tail -n 100 build.log || echo "(build.log not found)"
+          echo "=========================================="
+          echo ""
+          echo "====== ERRORS AND EXCEPTIONS ======"
+          grep -i -E "(error|exception|traceback|failed|no such)" build.log | tail -n 40 || echo "(no matches)"
+          echo "==================================="
 
       - name: Verify APK was produced
         run: |
-          ls -lh bin/*.apk
-          echo "APK build succeeded"
+          mkdir -p bin
+          if ls bin/*.apk 1>/dev/null 2>&1; then
+            echo "APK found:"
+            ls -lh bin/*.apk
+          else
+            echo "ERROR: No APK in bin/. Listing workspace to help diagnose:"
+            echo "--- bin/ contents ---"
+            ls -la bin/ || echo "(bin/ is empty or missing)"
+            echo "--- .buildozer/android/app/ ---"
+            ls -la .buildozer/android/app/ 2>/dev/null || echo "(directory missing)"
+            echo "--- Find any .apk anywhere ---"
+            find . -name "*.apk" 2>/dev/null || echo "(none found)"
+            exit 1
+          fi
 
-      - name: Show APK min/target SDK (sanity check)
+      - name: Show APK min/target SDK
         run: |
           APK=$(ls bin/*.apk | head -1)
-          aapt dump badging "$APK" | grep -E "sdkVersion|targetSdkVersion"
+          echo "Checking: $APK"
+          aapt dump badging "$APK" | grep -E "sdkVersion|targetSdkVersion|package"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -145,11 +178,3 @@ jobs:
           path: bin/*.apk
           if-no-files-found: error
           retention-days: 30
-
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-failure
-          path: build.log
-          retention-days: 7
