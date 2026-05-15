@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   build:
@@ -13,17 +14,19 @@ jobs:
       - name: Checkout Source
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # Python 3.10 is required — Cython 0.29.36 + buildozer 1.5.0
+          # have known issues with 3.11+
+          python-version: "3.10"
 
-      - name: Install Dependencies
+      - name: Install System Dependencies
         run: |
           sudo apt update
-
           sudo apt install -y \
-            zip unzip openjdk-17-jdk \
+            zip unzip \
+            openjdk-17-jdk \
             python3-pip \
             build-essential \
             git \
@@ -51,24 +54,93 @@ jobs:
             libportmidi-dev \
             libswscale-dev \
             libavformat-dev \
-            libavcodec-dev 
+            libavcodec-dev \
+            ccache \
+            lld \
+            aapt
 
-      - name: Install Python Packages
+      - name: Set JAVA_HOME to Java 17
         run: |
-          pip install --upgrade pip
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+          echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> $GITHUB_PATH
+
+      - name: Install Python Build Tools
+        run: |
+          pip install --upgrade pip setuptools wheel
           pip install Cython==0.29.36
           pip install buildozer==1.5.0
-          pip install python-for-android==2024.01.29
+          # Do NOT pin python-for-android separately.
+          # buildozer 1.5.0 resolves and installs the correct compatible version.
 
-      - name: Clean build cache
-        run: rm -rf .buildozer
+      - name: Set up ccache (speeds up repeated C/C++ compilation)
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: android-ccache-${{ runner.os }}
 
-      - name: Build APK
+      - name: Cache Android SDK + NDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer/android/platform/android-sdk
+            ~/.buildozer/android/platform/android-ndk-r25b
+          key: android-sdk-ndk-${{ runner.os }}-api34-ndk25b
+          restore-keys: |
+            android-sdk-ndk-${{ runner.os }}-
+
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Cache p4a build artefacts
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer/android/platform/build-*
+          key: p4a-build-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            p4a-build-${{ runner.os }}-
+
+      - name: Clean stale .buildozer folder (local artefacts only, not SDK/NDK)
         run: |
-          buildozer android debug
+          # Remove only the compiled app artefacts, not the downloaded SDK/NDK
+          rm -rf .buildozer/android/app
+          rm -rf .buildozer/android/platform/build-arm64-v8a
+          rm -rf .buildozer/android/platform/build-armeabi-v7a
 
-      - name: Upload APK
+      - name: Build debug APK
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          PATH: /usr/lib/jvm/java-17-openjdk-amd64/bin:/usr/lib/ccache:${{ env.PATH }}
+          # Accept Android SDK licences non-interactively
+          ANDROID_SDK_ROOT: ${{ github.workspace }}/.buildozer/android/platform/android-sdk
+        run: |
+          buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Verify APK was produced
+        run: |
+          ls -lh bin/*.apk
+          echo "✅ APK build succeeded"
+
+      - name: Show APK min/target SDK (sanity check)
+        run: |
+          APK=$(ls bin/*.apk | head -1)
+          aapt dump badging "$APK" | grep -E "sdkVersion|targetSdkVersion"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: apk
+          name: DengueGuardian-debug-apk
           path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-failure
+          path: build.log
+          retention-days: 7
