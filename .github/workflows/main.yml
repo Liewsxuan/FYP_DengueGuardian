@@ -50,7 +50,7 @@ jobs:
             libsdl2-mixer-dev \
             libsdl2-ttf-dev \
             libportmidi-dev \
-            libswscale-dev \
+            libswscave-dev \
             libavformat-dev \
             libavcodec-dev \
             ccache \
@@ -64,43 +64,66 @@ jobs:
           echo "/usr/lib/ccache" >> $GITHUB_PATH
 
       # ----------------------------------------------------------------
-      # FIX 1: "No module named 'cgi'" — the cgi module was removed in
-      # Python 3.13. The GitHub runner has multiple Python versions
-      # installed system-wide. p4a's subprocess was inheriting the system
-      # python3 (which may be 3.13) instead of the 3.10 we set up.
+      # ROOT CAUSE FIX
       #
-      # Solution: explicitly tell p4a which Python binary to use by
-      # setting PYTHON and PYTHONPATH, and verify what python3 resolves to
-      # before running buildozer.
+      # The traceback shows:
+      #   /tmp/build-env-4mmaj4wc/lib/python3.14/site-packages/Cython/...
+      #
+      # p4a internally calls `pip install` inside a fresh temp virtualenv.
+      # It creates that venv by running the system `python3` binary —
+      # NOT the GitHub Actions-managed Python 3.10.
+      #
+      # On ubuntu-22.04 runners as of 2025, the system python3 resolves
+      # to Python 3.14 (installed by deadsnakes or another tool in the
+      # runner image). Python 3.14 has no `cgi` module, so Cython's
+      # Tempita (used during wheel building) crashes immediately.
+      #
+      # The only reliable fix is to REPLACE the system python3 symlink
+      # so that any process — including p4a's internal venv creation —
+      # gets Python 3.10 when it calls `python3`.
       # ----------------------------------------------------------------
-      - name: Verify Python version and fix interpreter
+      - name: Force system python3 → Python 3.10
         run: |
-          echo "=== which python / python3 ==="
-          which python
-          which python3
-          python --version
-          python3 --version
-          echo "=== pip version ==="
-          pip --version
+          PYTHON310="/opt/hostedtoolcache/Python/3.10.20/x64/bin/python3.10"
 
-          # Force the PATH-resolved python3 to be our 3.10 by symlinking
-          PYTHON310=$(which python)
+          echo "Before fix:"
+          ls -la /usr/bin/python3* 2>/dev/null || true
+          python3 --version || true
+
+          # Replace every system python3 entry point with our 3.10
+          sudo ln -sf "$PYTHON310" /usr/bin/python3
+          sudo ln -sf "$PYTHON310" /usr/bin/python
           sudo ln -sf "$PYTHON310" /usr/local/bin/python3
           sudo ln -sf "$PYTHON310" /usr/local/bin/python
 
-          echo "=== After symlink ==="
+          # Also update /usr/bin/python3 alternatives if present
+          sudo update-alternatives --install /usr/bin/python3 python3 "$PYTHON310" 100 2>/dev/null || true
+          sudo update-alternatives --set python3 "$PYTHON310" 2>/dev/null || true
+
+          echo ""
+          echo "After fix:"
           python3 --version
           python --version
+          which python3
+          which python
 
       - name: Install Python Build Tools
         run: |
-          pip install --upgrade pip setuptools wheel
-          # Cython 0.29.36 is the last version compatible with Kivy 2.2.1's
-          # .pyx files. Newer Cython changes the API and breaks config.pxi resolution.
-          pip install Cython==0.29.36
-          pip install buildozer==1.5.0
-          # Verify Cython is correct version
-          python -c "import Cython; print('Cython version:', Cython.__version__)"
+          # Use our forced 3.10 for all pip installs
+          python3 -m pip install --upgrade "pip==23.3.2"
+          python3 -m pip install "setuptools==68.2.2" "wheel==0.41.3"
+          python3 -m pip install "Cython==0.29.36"
+          python3 -m pip install "buildozer==1.5.0"
+          python3 -m pip install "python-for-android==2023.05.21"
+
+          echo ""
+          echo "=== Installed package versions ==="
+          python3 -m pip show buildozer python-for-android Cython | grep -E "^(Name|Version)"
+          echo ""
+          echo "=== Final python3 check ==="
+          python3 --version
+          python3 -c "import sys; print('sys.version:', sys.version)"
+          python3 -c "import Cython; print('Cython:', Cython.__version__)"
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -125,45 +148,16 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-
 
-      # ----------------------------------------------------------------
-      # FIX 2: "config.pxi not resolved" — this is a stale p4a build
-      # cache problem. When a cached build-* directory exists from a
-      # previous failed or mismatched run, p4a's Cython dependency
-      # scanner finds half-compiled .pxi files in the wrong state and
-      # fails to resolve them.
-      #
-      # Solution: do NOT cache the p4a build-* directories at all.
-      # They are architecture-specific compiled C/Cython outputs that
-      # must be built fresh against the exact SDK+NDK+Cython combination.
-      # Only cache the SDK/NDK (which never changes) and pip (small).
-      # ----------------------------------------------------------------
-
-      # ----------------------------------------------------------------
-      # FIX 3: Wipe ALL of .buildozer except the SDK/NDK cache.
-      # The previous workflow only deleted build-arm64 and build-armeabi
-      # but left behind .buildozer/android/platform/python-for-android/
-      # which also contains stale .pxi / .pxd files from prior runs.
-      # ----------------------------------------------------------------
-      - name: Clean ALL stale buildozer artefacts (keep SDK/NDK only)
+      - name: Clean all stale buildozer artefacts
         run: |
-          # Keep SDK and NDK, wipe everything else buildozer generated
           rm -rf .buildozer
-
-          # Also clean the global p4a cache which persists between runs
-          # and is the primary source of stale config.pxi errors
           rm -rf ~/.buildozer/android/platform/build-*
           rm -rf ~/.buildozer/android/platform/python-for-android
           rm -rf ~/.buildozer/android/app
-
-          echo "Cleaned. Remaining in ~/.buildozer/android/platform/:"
-          ls ~/.buildozer/android/platform/ 2>/dev/null || echo "(empty — SDK/NDK will be downloaded)"
+          echo "SDK/NDK cache:"
+          ls ~/.buildozer/android/platform/ 2>/dev/null || echo "(empty — will download)"
 
       - name: Build debug APK
-        env:
-          # Force p4a to use our Python 3.10, not any system python3
-          PYTHON: python
-          # Ensure the correct SDK root is visible to buildozer/p4a
-          ANDROID_SDK_ROOT: ${{ github.workspace }}/.buildozer/android/platform/android-sdk
         run: |
           set -o pipefail
           buildozer -v android debug 2>&1 | tee build.log
@@ -194,10 +188,8 @@ jobs:
             ls -lh bin/*.apk
           else
             echo "ERROR: No APK found. Diagnosing..."
-            echo "--- bin/ ---"
-            ls -la bin/ 2>/dev/null || echo "(missing)"
-            echo "--- find .apk ---"
-            find . -name "*.apk" 2>/dev/null || echo "(none)"
+            ls -la bin/ 2>/dev/null || echo "(bin/ missing)"
+            find . -name "*.apk" 2>/dev/null || echo "(no .apk anywhere)"
             exit 1
           fi
 
