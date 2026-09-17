@@ -12,7 +12,7 @@ version = 1.0
 # ---------------------------------------------------------------
 # REQUIREMENTS
 # ---------------------------------------------------------------
-requirements = python3,kivy==2.2.1,kivymd==1.1.1,requests,urllib3,certifi,plyer,pillow,kivy_garden.mapview
+requirements = python3==3.11.9,hostpython3==3.11.9,kivy==2.2.1,kivymd==1.1.1,requests,urllib3,certifi,plyer,pillow,kivy_garden.mapview
 
 orientation = portrait
 fullscreen = 0
